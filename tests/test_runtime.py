@@ -147,7 +147,7 @@ class RuntimeTests(unittest.TestCase):
         def after_schema(prompt):
             self.assertIn('missing=exit_behavior',prompt)
             self.assertIn('Input existence:',prompt)
-            return {'action':'write','path':'artifacts/intake.json','data':audit}
+            return {'action':'write','path':'artifacts/intake.json','data':audit['slots']}
         def handoff(prompt):
             path=re.search(r'vault/runs/[0-9a-f]{16}/a[0-9]+/handoff.json',prompt).group()
             return {'action':'write','path':path,'data':{'status':'ready','open_discrepancies':[]}}
@@ -167,6 +167,46 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(denials),1)
         self.assertIn('missing=exit_behavior',denials[0]['reason'])
         self.assertEqual(parse_action('{"action":"write","path":"x.json","data":[]}')['data'],[])
+
+    def test_intake_format_normalization_does_not_invent_evidence(self):
+        from optimal_harness.runtime import intake_document
+        from optimal_harness.verifier import LIFECYCLE, Verifier
+        flat = {key: {'status': 'citation', 'quote': 'invented evidence',
+                      'because': 'Explicit rule.'} for key in LIFECYCLE}
+        document = intake_document(flat)
+        self.assertEqual(document, {'slots': flat})
+        (self.root/'audit.json').write_text(json.dumps(document))
+        self.assertEqual(len(Verifier(self.root).intake('audit.json', 'spec.md')), 9)
+        self.assertTrue(Verifier(self.root).embedded_quotes('audit.json', ['spec.md'], 'spec.md'))
+        for bad in ({key: 'unstructured claim' for key in LIFECYCLE},
+                    {'slots': {key: {'status': 'citation', 'quote': 'x'} for key in LIFECYCLE}},
+                    [], 'not json'):
+            with self.assertRaises(PolicyError):
+                intake_document(bad)
+        gaps = {'slots': {key: {'status': 'gap', 'detail': 'Undefined'} for key in LIFECYCLE}}
+        self.assertEqual(intake_document(gaps), gaps)
+        (self.root/'audit.json').write_text(json.dumps(gaps))
+        self.assertTrue(all('unresolved spec gap' in error for error in
+                            Verifier(self.root).intake('audit.json', 'spec.md')))
+
+    def test_intake_format_retry_bound_never_checkpoints_invalid_document(self):
+        from optimal_harness.verifier import LIFECYCLE
+        class Queue(FakeQueue):
+            async def request(q, prompt, *args):
+                q.calls += 1
+                if q.calls > 1:
+                    self.assertIn('INTAKE schema:', prompt)
+                # Different malformed values avoid the generic repeated-action breaker.
+                value = {key: 'invalid ' + str(q.calls) for key in LIFECYCLE}
+                return Completion(json.dumps({'action': 'write', 'path': 'artifacts/intake.json',
+                                              'data': value}), 100, 80, 30)
+        self.engine.queue = Queue([])
+        self.submit(); asyncio.run(self.engine.serve(1))
+        self.assertEqual(self.engine.queue.calls, 3)
+        self.assertIn('intake_format_exhausted', self.store.tasks('wordcounter')[0]['failure'])
+        self.assertFalse((self.root/'artifacts/intake.json').exists())
+        self.assertFalse(any(cp['path'] == 'artifacts/intake.json'
+                             for cp in self.store.checkpoints('wordcounter')))
 
     def test_unhealthy_lane_refuses_further_work_without_explicit_recovery(self):
         from optimal_harness.model import LocalChatClient,ModelQueue,ModelError

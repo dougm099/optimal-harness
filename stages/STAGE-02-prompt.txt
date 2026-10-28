@@ -1,0 +1,41 @@
+# STAGE-02 — FIXER: get the word-counter example to AWAITING_COORDINATOR
+
+Role: FIXER. The coordinator (Doofy) verifies independently, outside
+your sandbox. You are on git branch codex/stage-02-wordcounter in
+~/optimal-harness. Commit your work to this branch.
+
+DEFECT (from the harness's own run records): the word-counter
+example (examples/run_local.py, examples/word-counter/) has never
+completed. Runs 01-05 in runs/wordcounter-*/ are the evidence; the
+recurring failure is at the INTAKE stage — run 05 escalated with
+"intake_spec_gaps:intake unreadable: 'slots'": the local worker
+model's intake output does not reliably match the schema the
+harness expects, and the stage escalates instead of recovering.
+(Run 06 was interrupted externally; ignore it.)
+
+TASK: Make the example reach AWAITING_COORDINATOR by making the
+harness robust to the worker model's format variance — e.g. some
+combination of: a stage prompt carrying the exact output skeleton,
+tolerant parsing of near-miss outputs, and a bounded
+retry-with-deterministic-feedback loop before escalation. Choose
+the smallest sound combination. The strictness that matters is
+NOT negotiable: citation checks, checkpoint digests, plan
+validation, and the gate stay exactly as strict. Tolerance applies
+to the worker's FORMAT, never to accepting unverified content.
+
+IMMUTABLE: examples/word-counter/grader/ and the task spec inside
+examples/word-counter/plan.json — do not edit them to make the run
+pass. Editable: optimal_harness/ and run configuration.
+
+EXECUTION: attempt the run yourself
+(python3 examples/run_local.py — see its usage and
+runs/wordcounter-*.log for how prior runs were invoked). If your
+sandbox blocks loopback sockets (model endpoint or board), say so
+in the result and stop after the code changes — the coordinator
+executes runs in that case.
+
+WRITE stages/STAGE-02-result.md: what you changed and why, which
+failure modes it addresses, run outcome if you could run it
+(exact result.json status), and what remains. Then git add -A and
+git commit with a message summarizing the stage. Never modify
+~/harness or ~/vault. Standard library only.

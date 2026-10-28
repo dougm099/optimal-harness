@@ -49,7 +49,7 @@ def make_brief(role: str, plan: dict, notes: str = "", source_stage: str = "") -
 
 
 class Engine:
-    def __init__(self, store: Store, queue: ModelQueue, lease_seconds: int = 60):
+    def __init__(self, store: Store, queue: ModelQueue, lease_seconds: int = 1800):
         self.store = store
         self.queue = queue
         self.lease_seconds = lease_seconds
@@ -134,6 +134,8 @@ class Engine:
         conf = plan["stages"][role]
         declared_reads = task["brief"]["permitted_reads"]
         reads = declared_reads + [charter, brief_path, evidence, handoff]
+        reads += [cmd["capture"] for cmd in conf.get("commands", {}).values()]
+        reads += [f"{base}/commands/{name}.json" for name in conf.get("commands", {})]
         writes = conf.get("writes", []) + [evidence, handoff]
         return FileBroker(root, reads, writes), evidence, handoff, brief_path
 
@@ -164,7 +166,9 @@ class Engine:
         for path in set(conf.get("deliverables", [])) | set(checkpoints):
             if path not in {c["capture"] for c in conf.get("commands", {}).values()}:
                 spec = self.store.project(task["project_id"])["plan"]["spec"]
-                errors = Verifier(root).embedded_quotes(path, task["brief"]["permitted_reads"],
+                permitted_sources = task["brief"]["permitted_reads"] + [cmd["capture"] for cmd in conf.get("commands", {}).values()]
+                permitted_sources += [f"vault/runs/{task['id']}/a{task['generation']}/commands/{name}.json" for name in conf.get("commands", {})]
+                errors = Verifier(root).embedded_quotes(path, permitted_sources,
                                                          spec if task["stage"] == "INTAKE" else None)
                 if errors:
                     raise RuntimeError("citation_check_failed:" + ";".join(errors)[:600])

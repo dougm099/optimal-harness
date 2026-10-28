@@ -10,6 +10,32 @@ from .policy import PolicyError, atomic_write, confined, sandbox_command
 from .store import canonical, LeaseLost
 
 
+def intake_document(data):
+    """Normalize only an unambiguous wrapper omission; never invent slot content."""
+    from .verifier import LIFECYCLE
+    try:
+        document = json.loads(data) if isinstance(data, str) else data
+    except ValueError as exc:
+        raise PolicyError('INTAKE schema: data must be a complete JSON object') from exc
+    if isinstance(document, dict) and set(document) == set(LIFECYCLE):
+        document = {'slots': document}
+    slots = document.get('slots', {}) if isinstance(document, dict) else {}
+    if not isinstance(slots, dict) or set(slots) != set(LIFECYCLE):
+        keys = set(slots) if isinstance(slots, dict) else set()
+        raise PolicyError('INTAKE schema: rewrite the COMPLETE document with slots object; missing=' +
+                          ','.join(sorted(set(LIFECYCLE)-keys)) + '; unexpected=' +
+                          ','.join(sorted(keys-set(LIFECYCLE))))
+    for key in LIFECYCLE:
+        item = slots[key]
+        if not isinstance(item, dict) or item.get('status') not in ('citation', 'gap'):
+            raise PolicyError('INTAKE schema: ' + key + ' must be an object with status=citation or gap')
+        fields = ('quote', 'because') if item['status'] == 'citation' else ('detail',)
+        for field in fields:
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise PolicyError('INTAKE schema: ' + key + '.' + field + ' must be a nonempty string')
+    return document
+
+
 async def run_task(engine, task):
     store = engine.store
     project = store.project(task['project_id'])
@@ -25,6 +51,7 @@ async def run_task(engine, task):
     repeat = 0
     previous = None
     seen_actions = {}
+    intake_format_errors = 0
     manifest = {'task': task['id'], 'generation': task['generation'], 'role': task['stage'],
                 'budget': ledger.budget, 'static_prefix_sha256': hashlib.sha256(SYSTEM_PREFIX.encode()).hexdigest(),
                 'charter_sha256': plan['charter_hashes'][f"vault/charters/{task['stage'].lower()}.md"],
@@ -33,7 +60,14 @@ async def run_task(engine, task):
     manifest['cache_configuration_sha256'] = hashlib.sha256(canonical(manifest['cache_configuration']).encode()).hexdigest()
 
     def trusted_write(path, data):
-        store.commit(task, lambda c: atomic_write(confined(root, path), data), allow_report=True)
+        def effect(c):
+            atomic_write(confined(root, path), data)
+            # An honest runtime error may replace a model's ready handoff.
+            # Keep its new trusted value checkpointed rather than falsely
+            # diagnosing the runtime's own report update as outside tampering.
+            if path in checkpoints:
+                engine._checkpoint(root, task, path, checkpoints, 'trusted_report', c)
+        store.commit(task, effect, allow_report=True)
 
     def write_checkpoint(path, data=None, append=False):
         def effect(c):
@@ -159,14 +193,15 @@ async def run_task(engine, task):
                 elif op in ('write', 'append'):
                     data = action["data"]
                     if task['stage'] == 'INTAKE' and action['path'] in conf.get('deliverables', []):
-                        from .verifier import LIFECYCLE
-                        document = json.loads(data) if isinstance(data, str) else data
-                        slots = document.get('slots', {}) if isinstance(document, dict) else {}
-                        if not isinstance(slots, dict) or set(slots) != set(LIFECYCLE):
-                            keys = set(slots) if isinstance(slots, dict) else set()
-                            raise PolicyError('INTAKE schema: rewrite the COMPLETE document with slots object; missing=' +
-                                              ','.join(sorted(set(LIFECYCLE)-keys)) + '; unexpected=' +
-                                              ','.join(sorted(keys-set(LIFECYCLE))))
+                        try:
+                            if op != 'write':
+                                raise PolicyError('INTAKE schema: use write for the complete JSON document, not append')
+                            data = intake_document(data)
+                        except PolicyError:
+                            intake_format_errors += 1
+                            if intake_format_errors >= 3:
+                                raise RuntimeError('intake_format_exhausted:three invalid documents; no artifact accepted')
+                            raise
                     if task['stage'] == 'REVIEW' and action['path'] in conf.get('deliverables', []):
                         report = json.loads(data) if isinstance(data, str) else data
                         if (not isinstance(report, dict) or report.get('reviewed_stage') != task['brief']['prior_stage'] or
@@ -189,12 +224,16 @@ async def run_task(engine, task):
                         output = sandbox_command(root, command, min(ledger.budget['max_command_seconds'],
                                                  ledger.budget['max_seconds']-ledger.seconds))
                         capture = command['capture']
-                        atomic_write(confined(root, capture), (canonical(output)+'\n').encode())
-                        engine._checkpoint(root, task, capture, checkpoints, 'command', c)
+                        payload = (canonical(output)+'\n').encode()
+                        owned_capture = f"vault/runs/{task['id']}/a{task['generation']}/commands/{action['name']}.json"
+                        atomic_write(confined(root, owned_capture), payload)
+                        engine._checkpoint(root, task, owned_capture, checkpoints, 'command', c)
+                        atomic_write(confined(root, capture), payload)
+                        engine._checkpoint(root, task, capture, checkpoints, 'command_alias', c)
                         for path in command.get('writes', []):
                             if confined(root, path).is_file():
                                 engine._checkpoint(root, task, path, checkpoints, 'command_write', c)
-                        return {'capture': capture, 'exit_code': output['exit_code'], 'reason': output['reason'],
+                        return {'capture': owned_capture, 'declared_capture': capture, 'exit_code': output['exit_code'], 'reason': output['reason'],
                                 'containment': output.get('containment', 'test-double')}
                     receipt = await asyncio.to_thread(store.commit, task, command_effect)
                     last = canonical(receipt) + '\nFull output is at capture pointer. Read it if needed.'
